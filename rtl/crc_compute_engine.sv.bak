@@ -1,0 +1,154 @@
+module crc_compute_engine
+import crc32_pkg::*;
+	#(
+	parameter STG =4,
+	)
+	(
+		input logic   clk,
+		input logic  arst_n ,
+		//
+		input logic i_sof_in, 
+		// user axi steraming intf
+		input logic  								 i_tx_valid,
+		input logic [DATA_WIDTH-1:0] i_tx_data,
+		input logic [KEEP_WIDTH-1:0] i_tx_tkeep,
+		input logic  								 i_tx_tlast,
+		// computed crc32 output with it valid status,
+		output logic [32-1:0] crc32_val,
+		output logic          crc32_vld
+		);
+
+localparam int unsigned PER_STG_NUM_BITS = DATA_WIDTH/STG    ;
+localparam int unsigned NUM_BYTES_W      = $clog2(KEEP_WIDTH);
+
+typedef struct packed{
+logic 								 tvalid; 
+logic [DATA_WIDTH-1:0] tdata ; 
+logic [KEEP_WIDTH-1:0] tkeep;
+logic tlast;
+logic sof_vld;
+logic [NUM_BYTES_W-1:0]vbyte_cnt ;
+
+} axist_bus_t ;
+
+axist_bus_t [       STG-1:0]            st_pipe_bus   ;
+logic       [         STG:0][CRC_W-1:0] stg_crc_bm    ;
+logic       [         STG:0][CRC_W-1:0] stg_acc_crc_bm;
+logic       [ NUM_BYTES_W:0]            byte_cnt      ;
+logic       [     CRC_W-1:0]            crc_stat_am   ;
+logic       [     CRC_W-1:0]            merge_xor_mat ;
+logic       [     CRC_W-1:0]            crc_stat_nxt  ;
+logic       [     CRC_W-1:0]            crc_stat      ;
+logic       [DATA_WIDTH-1:0]            corr_mat      ;
+logic       [     CRC_W-1:0]            corr_crc      ;
+
+genvar  b_gv ; 
+genvar  a_gv ;
+
+//pipeline data and ctlr 
+generate
+
+	assign st_pipe_bus[0].tvalid 			= i_tx_valid ;
+	assign st_pipe_bus[0].tdata  			= i_tx_data  ;
+	assign st_pipe_bus[0].tkeep  			= i_tx_tkeep ;
+	assign st_pipe_bus[0].tlast  			= i_tx_tlast ;
+	assign st_pipe_bus[0].sof_vld  		= i_sof_in ;
+	assign st_pipe_bus[0].vbyte_cnt   = i_tx_tlast ? $countones(i_tx_tkeep) : KEEP_WIDTH  ;	
+	
+		//^(tdata_eff[GROUP0_HI-1:GROUP0_LO] & B_GROUP0_MASK_PACKED[k*GROUP0_W +: GROUP0_W]);
+		// (data in  [(stg*256)-1:0] & BGROUP MASK for ehc 32 bit 256 bit
+		for (b_gv=0 ;b_gv <32;b_gv++) begin: blk_crc_stg
+			
+		assign stg_crc_bm[0][b_gv] = ^(st_pipe_bus[0].tdata[(0*PER_STG_NUM_BITS)-1+PER_STG_NUM_BITS] & B_GROUP0_MASK_PACKED[b_gv*PER_STG_NUM_BITS+:PER_STG_NUM_BITS])  ;  
+		assign stg_crc_bm[1][b_gv] = ^(st_pipe_bus[1].tdata[(1*PER_STG_NUM_BITS)-1+PER_STG_NUM_BITS] & B_GROUP1_MASK_PACKED[b_gv*PER_STG_NUM_BITS+:PER_STG_NUM_BITS])  ; 
+		assign stg_crc_bm[2][b_gv] = ^(st_pipe_bus[2].tdata[(2*PER_STG_NUM_BITS)-1+PER_STG_NUM_BITS] & B_GROUP2_MASK_PACKED[b_gv*PER_STG_NUM_BITS+:PER_STG_NUM_BITS])  ;  
+		assign stg_crc_bm[3][b_gv] = ^(st_pipe_bus[3].tdata[(3*PER_STG_NUM_BITS)-1+PER_STG_NUM_BITS] & B_GROUP3_MASK_PACKED[b_gv*PER_STG_NUM_BITS+:PER_STG_NUM_BITS])  ;   
+		
+		end
+	always_ff @(posedge clk) begin 
+		if(~arst_n) 
+			stg_acc_crc_bm[0]<='0;
+		else   
+			stg_acc_crc_bm[0]<= stg_crc_bm[0];
+	end
+
+	for(a_gv =1 ;a_gv<STG;a_gv++)
+		always_ff @(posedge clk) begin 
+			st_pipe_bus[a_gv]   <= st_pipe_bus[a_gv-1];
+	end
+
+	for(a_gv =1 ;a_gv<STG;a_gv++)
+		always_ff @(posedge clk) begin 
+			stg_acc_crc_bm[a_gv]<= stg_crc_bm[a_gv-1] &stg_acc_crc_bm[a_gv-1] ;
+	end	
+endgenerate
+
+	always_ff @(posedge clk) begin : proc_crc_blk
+		if(~arst_n) begin
+			crc32_val <= '0;
+			crc32_vld <= 0;
+		end else begin
+			crc32_val <=st_pipe_bus[STG].tlast ? corr_crc:crc32_val  ;//stg_acc_crc_bm[STG] ;
+			crc32_vld <=st_pipe_bus[STG].tlast;
+		end
+	end
+
+
+
+	assign old_state_eff = sop_dly ? CRC_INIT : state_q;
+
+  generate
+    for (a_gv = 0; a_gv < 32; a_gv++) begin : blk_am_matrix
+      assign crc_stat_am[a_gv] = ^((st_pipe_bus[STG].sof_vld? CRC_INIT : crc_stat )& A_MASK_PACKED[a_gv*32 +: 32]);
+    end
+  endgenerate
+	
+  assign merge_xor_mat = crc_stat_am ^ stg_acc_crc_bm[D-1];
+
+	logic [7:0] corr_vld_byte; 
+	logic   	  tlast_fnl_stg;
+
+	assign corr_vld_byte = st_pipe_bus[STG-1].vbyte_cnt;   
+  assign corr_mat      = CORR_PACKED[corr_vld_byte*1024 +:1024];
+  assign tlast_vld     = 
+generate
+    for (a_gv = 0; a_gv < 32; a_gv++) begin : blk_am_matrix
+      assign corr_crc[a_gv] = ^(merge_xor_mat & corr_mat[a_gv*32 +: 32]);
+    end
+  endgenerate
+	
+
+always_ff @(posedge clk) begin 
+	if(~arst_n) begin
+		crc_stat <= '0;
+	end else begin
+		crc_stat <=  tlast_fnl_stg  ? corr_crc : merge_xor_mat ;
+	end
+end
+  // ---------------------------------------------------------------------
+  // Tail-beat correction (same mechanism/table as the single-cycle
+  // design), applied to `combined` when this cycle's delayed beat is the
+  // final beat of its frame.
+  // ---------------------------------------------------------------------
+  logic [31:0]   s_corrected;
+  logic [1023:0] corr_chunk;
+  assign corr_chunk = CORR_PACKED[vb_dly*1024 +: 1024];
+  generate
+    for (k = 0; k < 32; k++) begin : g_corr
+      assign s_corrected[k] = ^(combined & corr_chunk[k*32 +: 32]);
+    end
+  endgenerate
+
+  logic [31:0] next_state;
+  assign next_state = tlast_dly ? s_corrected : combined;
+
+  logic [31:0] state_inv;
+  assign state_inv = next_state ^ CRC_XOROUT;
+
+
+endmodule
+
+
+
+
+
